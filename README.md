@@ -2,8 +2,9 @@ Simple heroku app with a bash script for capturing heroku database backups and c
 
 Now using [aws cli v2](https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2-linux.html) - works with both `heroku-18` and `heroku-20` stacks.
 
-## Installation
+Backup script and instructions updated, based on https://pawelurbanek.com/heroku-postgresql-s3-backup.
 
+## Installation
 
 First, clone this project, then change directory into the newly created directory:
 
@@ -15,12 +16,13 @@ cd heroku-database-backups
 Create a project on heroku.
 
 ```
-heroku create my-database-backups
+heroku create my-database-backups --buildpack heroku-community/cli --region eu
 ```
-Add the heroku-buildpack-cli:
+
+Add another buildpack to enable AWS CLI access from within the script.
 
 ```
-heroku buildpacks:add https://github.com/heroku/heroku-buildpack-cli -a  my-database-backups
+heroku buildpacks:add heroku-community/awscli -a my-database-backups
 ```
 
 Next push this project to your heroku projects git repository.
@@ -32,11 +34,7 @@ git push heroku master
 
 Now we need to set some environment variables in order to get the heroku cli working properly using the [heroku-buildpack-cli](https://github.com/heroku/heroku-buildpack-cli).
 
-```
-heroku config:add HEROKU_API_KEY=`heroku auth:token` -a my-database-backups
-```
-
-This creates a token that will quietly expire in one year. To create a long-lived authorization token instead, do this:
+Create a long-lived authorization token:
 
 ```
 heroku config:add HEROKU_API_KEY=`heroku authorizations:create -S -d my-database-backups` -a my-database-backups
@@ -46,7 +44,7 @@ Next we need to add the amazon key and secret from the IAM user that you are usi
 
 ```
 heroku config:add AWS_ACCESS_KEY_ID=123456 -a my-database-backups
-heroku config:add AWS_DEFAULT_REGION=us-east-1 -a my-database-backups
+heroku config:add AWS_DEFAULT_REGION=eu-central-1 -a my-database-backups
 heroku config:add AWS_SECRET_ACCESS_KEY=132345verybigsecret -a my-database-backups
 ```
 
@@ -60,7 +58,7 @@ Be careful when setting the S3_BUCKET_PATH to leave off a trailing forward slash
 Finally, we need to add heroku scheduler and call [backup.sh](https://github.com/kbaum/heroku-database-backups/blob/master/bin/backup.sh) on a regular interval with the appropriate database and app.
 
 ```
-heroku addons:create scheduler -a my-database-backups
+heroku addons:create scheduler:standard -a my-database-backups
 ```
 
 Now open it up, in your browser with:
@@ -79,11 +77,17 @@ In the above command, APP is the name of your app within heroku that contains th
 
 ### Optional
 
-You can add a `HEARTBEAT_URL` to the script so a request gets sent every time a backup is made. All you have to do is add the variable value like:
+**Encrypt backups**
+
+You can set up a secure password that will be used to encrypt the database dump files before uploading them to S3. You can use OpenSSL for that:
 
 ```
-heroku config:add HEARTBEAT_URL=https://hearbeat.url -a my-database-backups
+heroku config:add GPG_PASSPHRASE=$(openssl rand -base64 32) -a my-database-backups
 ```
+
+Just make sure to save this password somewhere safe.
+
+**Do not capture a new backup**
 
 If you are using [heroku's scheduled backups](https://devcenter.heroku.com/articles/heroku-postgres-backups#scheduling-backups) you might only want to archive the latest
 backup to S3 for long-term storage. Set the `ONLY_CAPTURE_TO_S3` variable when running the command:
@@ -92,10 +96,79 @@ backup to S3 for long-term storage. Set the `ONLY_CAPTURE_TO_S3` variable when r
 ONLY_CAPTURE_TO_S3=true APP=your-app DATABASE=HEROKU_POSTGRESQL_NAVY_URL /app/bin/backup.sh
 ```
 
-#### Tip
-
-The default timezone is `UTC`. To use your [preferred timezone](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones) in the filename timestamp, set the `TZ` variable when calling the command:
+Note: to schedule Heroku backup:
 
 ```
-TZ=America/Los_Angeles APP=your-app DATABASE=HEROKU_POSTGRESQL_NAVY_URL /app/bin/backup.sh
+heroku pg:backups:schedule DATABASE_URL --at '01:00'
+```
+
+You might also want to consider adding a [bucket lifecycle rule](https://docs.aws.amazon.com/AmazonS3/latest/user-guide/create-lifecycle.html) to remove the older files and optimize storage costs.
+
+**Heartbeat**
+
+You can add a `HEARTBEAT_URL` to the script so a request gets sent every time a backup is made. All you have to do is add the variable value like:
+
+```
+heroku config:add HEARTBEAT_URL=https://hearbeat.url -a my-database-backups
+```
+
+## How to restore Heroku S3 PostgreSQL backup
+
+### AWS CLI configuration
+
+AWS CLI will be needed to restore the backup. You can install it locally by following [this tutorial](https://docs.aws.amazon.com/cli/latest/userguide/cli-chap-install.html).
+
+Now authenticate the AWS CLI by running:
+
+```
+aws configure
+```
+
+and inputting your IAM user `AWS Access Key ID` and `AWS Secret Access Key`. You can just press ENTER when asked to provide `Default region name` and `Default output format`.
+
+When it’s it up and running you can now generate a short-lived  download URL for your encrypted backup file. Let’s assume that its S3 path is `s3://heroku-secondary-backups/heroku-backup-2019-06-25_01.30.gpg`. You can download it with the following command:
+
+```
+wget $(aws s3 presign s3://heroku-secondary-backups/heroku-backup-2019-06-25_01.30.gpg --expires-in 5) -O backup.gpg
+```
+
+Once you have it on your local disc you can decrypt it by running:
+
+```
+gpg --batch --yes --passphrase=$GPG_PASSPHRASE -d backup.gpg | gunzip --to-stdout > backup.sql
+```
+
+
+
+Now you have to upload the decrypted version of a backup back to S3 bucket, use it to restore Heroku database and remove it from the bucket right after its been used. We will start with testing it out on a newly provisioned database add-on:
+
+```
+heroku addons:create heroku-postgresql:hobby-dev
+aws s3 cp backup.sql s3://heroku-secondary-backups/backup.sql
+heroku pg:backups:restore $(aws s3 presign s3://heroku-secondary-backups/backup.sql --expires-in 60) HEROKU_POSTGRESQL_GRAY_URL -a app-name
+aws s3 rm s3://heroku-secondary-backups/backup.sql
+```
+
+Remember to replace `HEROKU_POSTGRESQL_GRAY_URL` with the URL of your newly provisioned database add-on. You can check out the [Heroku docs](https://devcenter.heroku.com/articles/heroku-postgres-import-export) if you run into trouble
+
+
+
+You can now check if the content of your database looks correct by logging into it and running some queries:
+
+```
+heroku pg:psql HEROKU_POSTGRESQL_GRAY_URL
+```
+
+If everything looks OK you can now restore the backup file to your production database:
+
+```
+aws s3 cp backup.sql s3://heroku-secondary-backups/backup.sql
+heroku pg:backups:restore $(aws s3 presign s3://heroku-secondary-backups/backup.sql --expires-in 60) DATABASE_URL -a app-name
+aws s3 rm s3://heroku-secondary-backups/backup.sql
+```
+
+Alternatively, you could promote the new database add-on as your new primary database:
+
+```
+heroku pg:promote HEROKU_POSTGRESQL_GRAY_URL
 ```

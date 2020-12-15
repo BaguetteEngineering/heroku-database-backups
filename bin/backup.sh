@@ -1,7 +1,8 @@
 #!/bin/bash
 
 # terminate script as soon as any command fails
-set -e
+# https://vaneyckt.io/posts/safer_bash_scripts_with_set_euxo_pipefail/
+set -eo pipefail
 
 if [[ -z "$APP" ]]; then
   echo "Missing APP variable which must be set to the name of your app where the db is located"
@@ -18,43 +19,43 @@ if [[ -z "$S3_BUCKET_PATH" ]]; then
   exit 1
 fi
 
-# install aws-cli
-#  - this will already exist if we're running the script manually from a dyno more than once
-
-aws_command="/tmp/bin/aws"
-
-if [[ ! -f "${aws_command}" ]]; then
-  echo "aws cli v2..."
-  curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-  unzip -q awscliv2.zip
-  ./aws/install --bin-dir /tmp/bin --install-dir /tmp/aws
-fi
-
 # if the app has heroku pg:backup:schedules, we might just want to just archive the latest backup to S3
 # https://devcenter.heroku.com/articles/heroku-postgres-backups#scheduling-backups
 #
 # set ONLY_CAPTURE_TO_S3 when calling to skip database capture
 
-BACKUP_FILE_NAME="$(date +"%Y-%m-%d_%H-%M_%Z__")${APP}_${DATABASE}.dump"
-
 if [[ -z "$ONLY_CAPTURE_TO_S3" ]]; then
-  heroku pg:backups capture $DATABASE --app $APP
+  heroku pg:backups:capture $DATABASE --app $APP
 else
-  BACKUP_FILE_NAME="archive__${BACKUP_FILE_NAME}"
   echo " --- Skipping database capture"
 fi
 
-curl -o $BACKUP_FILE_NAME `heroku pg:backups:url --app $APP`
-FINAL_FILE_NAME=$BACKUP_FILE_NAME
+# Download the latest backup from Heroku and gzip it
+heroku pg:backups:download --output=/tmp/pg_backup.dump --app $APP
+gzip /tmp/pg_backup.dump
 
-if [[ -z "$NOGZIP" ]]; then
-  gzip $BACKUP_FILE_NAME
-  FINAL_FILE_NAME=$BACKUP_FILE_NAME.gz
+# Generate backup filename based on the current date
+BACKUP_FILE_NAME="heroku-backup_${APP}_${DATABASE}_$(date '+%Y-%m-%d_%H.%M')"
+BACKUP_FILE_EXTENSION=".gz"
+
+# Encrypt the gzipped backup file using GPG passphrase
+if [[ -n "$GPG_PASSPHRASE" ]]; then
+  gpg --yes --batch --passphrase=$GPG_PASSPHRASE -c /tmp/pg_backup.dump.gz
+  BACKUP_FILE_EXTENSION=".gz.gpg"
 fi
 
-${aws_command} s3 cp $FINAL_FILE_NAME s3://$S3_BUCKET_PATH/$APP/$DATABASE/$FINAL_FILE_NAME
+# Upload the file to S3 using AWS CLI
+aws s3 cp /tmp/pg_backup.dump$BACKUP_FILE_EXTENSION "s3://${S3_BUCKET_PATH}/${BACKUP_FILE_NAME}${BACKUP_FILE_EXTENSION}"
 
-echo "backup $FINAL_FILE_NAME complete"
+# Remove the plaintext backup file
+rm /tmp/pg_backup.dump.gz
+
+# Remove the encrypted backup file
+if [[ -n "$GPG_PASSPHRASE" ]]; then
+  rm /tmp/pg_backup.dump.gz.gpg
+fi
+
+echo "backup $BACKUP_FILE_NAME$BACKUP_FILE_EXTENSION complete"
 
 if [[ -n "$HEARTBEAT_URL" ]]; then
   echo "Sending a request to the specified HEARTBEAT_URL that the backup was created"
