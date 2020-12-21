@@ -106,7 +106,8 @@ You might also want to consider adding a [bucket lifecycle rule](https://docs.aw
 
 **Heartbeat**
 
-You can add a `HEARTBEAT_URL` to the script so a request gets sent every time a backup is made. All you have to do is add the variable value like:
+You can add a `HEARTBEAT_URL` to the script so a request gets sent every time a backup is made.
+Open an account on https://healthchecks.io/, create a new check, and add its URL as a config variable like:
 
 ```
 heroku config:add HEARTBEAT_URL=https://hearbeat.url -a my-database-backups
